@@ -261,16 +261,119 @@ local function eval_buffer(buf)
     api.nvim_buf_clear_namespace(buf, hl_group_ns, i, i + 1)
     api.nvim_buf_clear_namespace(buf, hl_vivid_call_ns, i, i + 1)
     set_highlight_groups_on_line(buf, line, i - 1)
-    set_highlight_vivid_calls_on_line(buf, line, i - 1)
+    -- set_highlight_vivid_calls_on_line(buf, line, i - 1)
   end
 
+  ts_hack(buf)
+
   return did_apply
+end
+
+local ts_hack_parser = nil
+function ts_hack(bufnr)
+  print("ts_hack")
+  local parser = ts_hack_parser
+  -- parse() actually returns trees, not tree
+  local trees, changes = parser:parse()
+  local tree = trees[1]
+
+  -- iter_captures returns all captures, *probably* in order, but that's not
+  -- documented
+  --
+  -- query = vim.treesitter.parse_query("lua", [[
+  --   (function_call
+  --     (identifier) @fn_name
+  --     (arguments (_) @fn_arg)
+  --     (any-of? @fn_name "hsl" "hsluv")) @call
+  -- ]])
+  --
+  -- query:iter_captures(...) -> [
+  --   function_call, identifier (hsl), string,
+  --   functon_call, ...
+  -- ]
+  --
+  -- since it's undocumented, it feels it may be better to inspect with
+  -- separate queries for each part.
+
+  -- find any hsl(uv) calls
+  local query_calls = vim.treesitter.parse_query("lua", [[
+    (function_call
+      (identifier) @fn_name
+      (arguments (_))
+      (#any-of? @fn_name "hsl" "hsluv"))
+  ]])
+
+  local query_call_string = vim.treesitter.parse_query("lua", [[
+    (function_call
+      (identifier) @fn_name
+      (arguments (string) @fn_arg)
+      (any-of? @fn_name "hsl" "hsluv")) @call
+  ]])
+
+  for _, node in query_calls:iter_captures(tree:root(), bufnr) do
+    local fn_identifier_node = node
+    local fn_call_node = node:parent()
+
+    local is_field_expression = function(node) return node:type() == "field_expression" end
+    local is_function_call = function(node) return node:type() == "function_call" end
+
+    local find_best_call
+    find_best_call = function(last_fn_call)
+      -- hsl(...).de(..).sa(..)
+      -- fn_call "hsl...sa(..)"      <- we want this
+      --  f_exp "hsl(...).de(..).sa"
+      --    fn_call "hsl..de(..)"    } "call & expr pair"
+      --      f_exp "hsl(...).de"    }
+      --        fn_call "hsl(...)"   <- we start here
+      if is_field_expression(last_fn_call:parent())
+        and is_function_call(last_fn_call:parent():parent()) then
+        return find_best_call(last_fn_call:parent():parent())
+      else
+        return last_fn_call
+      end
+    end
+    local run_call = function(call_str)
+      local code = "return require('lush')."..call_str
+      local fn, err = loadstring(code)
+      local success, result = pcall(fn)
+      if success then
+        return result
+      else
+        return nil
+      end
+    end
+    local best_call_node = find_best_call(fn_call_node)
+    if true or best_call_node then
+      local fn_call_as_str = vim.treesitter.get_node_text(best_call_node, bufnr)
+      local color = run_call(fn_call_as_str)
+      if color then
+        create_highlight_group_for_color(color, {}) -- no cache for now
+        local group_name = create_highlght_group_name_for_color(color)
+        -- print("make hl for " .. group_name)
+
+        local s_row, s_col, e_row, e_col = best_call_node:range()
+        api.nvim_buf_add_highlight(bufnr, hl_vivid_call_ns,
+                                   group_name, s_row,
+                                   s_col, e_col) -- -1 for api-indexing
+      end
+    end
+  end
+
+  -- not totally clear if this is more useful iter
+  --  for pattern, match, metadata in query_calls:iter_matches(tree:root(), bufnr) do
+  --    print(vim.inspect(pattern), vim.inspect(match))
+  --    for id, node in pairs(match) do
+  --      local fn_call = vim.treesitter.get_node_text(node, bufnr)
+  --      print(fn_call)
+  --    end
+  --  end
 end
 
 local M = {}
 
 M.setup_realtime_eval = function(buf, options)
   buf = buf or 0
+  ts_hack_parser = vim.treesitter.get_parser(buf, "lua")
 
   -- on_lines can be called multiple times per ms (according to uv timers,
   -- which are some what loose). We will perform a minor debounce, so if a user
