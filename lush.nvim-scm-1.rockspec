@@ -24,7 +24,7 @@ source = {
 
 if _MODREV == 'scm' then
    source = {
-      url = 'git://github.com/rktjmp/lush.nvim',
+      url = 'git://github.com/teto/lush.nvim',
    }
 end
 
